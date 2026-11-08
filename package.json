@@ -1,0 +1,18 @@
+{
+  "name": "study-tracker-word-addin",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Word add-in that times active study by highlights and estimates time to finish.",
+  "scripts": {
+    "start": "node server.js",
+    "sideload": "office-addin-dev-settings sideload manifest.xml desktop --app Word",
+    "set-url": "node set-url.js",
+    "validate": "office-addin-manifest validate manifest.xml",
+    "test": "node test/core.test.js"
+  },
+  "devDependencies": {
+    "office-addin-dev-certs": "^3.0.1",
+    "office-addin-dev-settings": "^4.0.1",
+    "office-addin-manifest": "^3.0.1"
+  }
+}
