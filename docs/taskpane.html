@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Study Tracker</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <link rel="stylesheet" href="taskpane.css" />
+</head>
+<body>
+  <main id="app">
+    <div id="banner" class="banner" hidden></div>
+
+    <section class="status-row">
+      <span id="statusDot" class="dot"></span>
+      <div>
+        <div id="statusLabel" class="status-label">Starting…</div>
+        <div id="statusHint" class="status-hint"></div>
+      </div>
+      <button id="pauseBtn" class="icon-btn" title="Pause tracking" aria-label="Pause tracking">
+        <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><rect x="5" y="4" width="3.2" height="12" rx="1"/><rect x="11.8" y="4" width="3.2" height="12" rx="1"/></svg>
+      </button>
+    </section>
+
+    <section class="card timer-card">
+      <div class="eyebrow">Active study · this session</div>
+      <div id="sessionTime" class="big-time">0:00</div>
+      <div class="split">
+        <div><div class="eyebrow">Today</div><div id="todayTime" class="mid">0 s</div></div>
+        <div><div class="eyebrow">This file, total</div><div id="totalTime" class="mid">0 s</div></div>
+        <div><div class="eyebrow">Highlights</div><div id="inputCount" class="mid">0</div></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="row-between">
+        <div class="eyebrow">Progress · furthest highlight</div>
+        <div id="progressPct" class="pct">–</div>
+      </div>
+      <div class="track" aria-hidden="true"><div id="progressFill" class="fill"></div><div id="progressMark" class="mark"></div></div>
+      <div id="progressDetail" class="muted small">Scanning document…</div>
+      <button id="jumpBtn" class="link-btn" disabled>Jump to my last highlight →</button>
+    </section>
+
+    <section class="card eta-card">
+      <div class="eyebrow">Estimated active study left</div>
+      <div id="etaMain" class="eta">–</div>
+      <div id="etaDetail" class="muted small"></div>
+    </section>
+
+    <section class="card">
+      <div class="eyebrow">Sessions</div>
+      <ol id="sessionList" class="sessions"><li class="muted small empty">No study sessions yet. Highlight something to start.</li></ol>
+      <button id="csvBtn" class="link-btn">Copy all sessions as CSV</button>
+      <textarea id="csvBox" class="csv" hidden readonly></textarea>
+    </section>
+
+    <details class="card settings">
+      <summary>Settings</summary>
+      <label class="field">
+        <span>Count me as active for up to</span>
+        <select id="idleSelect">
+          <option value="30">30 s after each highlight</option>
+          <option value="60">1 min after each highlight</option>
+          <option value="120">2 min after each highlight</option>
+          <option value="180">3 min after each highlight</option>
+          <option value="300">5 min after each highlight</option>
+          <option value="600">10 min after each highlight</option>
+        </select>
+        <small class="muted">If your next highlight comes sooner, the time in between counts in full. Longer pauses count only up to this limit.</small>
+      </label>
+      <label class="field">
+        <span>Highlights that count toward progress</span>
+        <select id="colorSelect">
+          <option value="any">Any colour</option>
+          <option value="#FFFF00">Yellow</option>
+          <option value="#00FF00">Bright green</option>
+          <option value="#00FFFF">Turquoise</option>
+          <option value="#FF00FF">Pink</option>
+          <option value="#0000FF">Blue</option>
+          <option value="#FF0000">Red</option>
+          <option value="#000080">Dark blue</option>
+          <option value="#008080">Teal</option>
+          <option value="#008000">Green</option>
+          <option value="#800080">Violet</option>
+          <option value="#800000">Dark red</option>
+          <option value="#808000">Dark yellow</option>
+          <option value="#808080">Gray 50%</option>
+          <option value="#C0C0C0">Gray 25%</option>
+        </select>
+        <small class="muted">Useful if the file already came with highlights in another colour.</small>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="autoOpen" />
+        <span>Open this panel automatically when I open this file</span>
+      </label>
+      <button id="resetBtn" class="danger-btn">Reset tracking for this file</button>
+      <p class="muted small">Tracking runs while this panel is open. Stats are stored inside the file itself, so save the document to keep them.</p>
+    </details>
+  </main>
+
+  <script src="core.js"></script>
+  <script src="taskpane.js"></script>
+</body>
+</html>
