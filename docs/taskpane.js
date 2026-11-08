@@ -1,18 +1,20 @@
-/* Study Tracker – Word task pane. Depends on core.js (window.StudyCore) and Office.js. */
+/* Study Tracker – Word task pane (v2). Depends on core.js (window.StudyCore) and Office.js. */
 (function () {
   "use strict";
   var C = window.StudyCore;
   var SETTINGS_KEY = "studyTracker";
   var AUTO_OPEN_KEY = "Office.AutoShowTaskpaneWithDocument";
+  var BRIDGE_CAP_MS = 5 * 60 * 1000; // after the pop-up, at most this much of the gap is counted back
 
   var state = C.newState();
   var localKey = "studyTracker:untitled";
 
   // scanner bookkeeping
-  var scanning = false, lastScanEnd = 0, lastScanDur = 300, dirty = true, lastSelChange = 0;
-  var prevCoarse = null, prevSelIdx = [], fineCache = {};
-  var prog = { progress: null, total: 0, reached: 0, lastIdx: -1, wordIdx: null };
-  var saveTimer = null, lastError = null;
+  var scanning = false, lastScanEnd = 0, lastScanDur = 300, dirty = true, lastPoke = 0;
+  var prevHl = null, prevTextHashes = null, prevSelIdx = [], fineCache = {};
+  var prog = { progress: null, total: 0, reached: 0, by: null, lastIdx: -1, wordIdx: null, paraWords: [] };
+  var saveTimer = null, lastHeartbeat = 0;
+  var wasActive = false, dialog = null;
 
   var $ = function (id) { return document.getElementById(id); };
 
@@ -27,14 +29,27 @@
     }
     loadState();
     bindUI();
-    Office.context.document.addHandlerAsync(Office.EventType.DocumentSelectionChanged, function () {
-      dirty = true;
-      lastSelChange = Date.now();
-    });
+    Office.context.document.addHandlerAsync(Office.EventType.DocumentSelectionChanged, poke);
+    listenForEdits();
+    wasActive = C.isActive(state, Date.now());
     render();
     scan();
     setInterval(tick, 1000);
   });
+
+  function poke() { dirty = true; lastPoke = Date.now(); }
+
+  // Word 2023+ tells us directly when paragraphs change: scan right away instead of waiting.
+  function listenForEdits() {
+    if (!Office.context.requirements.isSetSupported("WordApi", "1.6")) return;
+    var onEdit = function (args) { if (!args || args.source !== "Remote") poke(); };
+    Word.run(function (ctx) {
+      ctx.document.onParagraphChanged.add(onEdit);
+      ctx.document.onParagraphAdded.add(onEdit);
+      ctx.document.onParagraphDeleted.add(onEdit);
+      return ctx.sync();
+    }).catch(function (e) { console.warn("paragraph events unavailable", e); });
+  }
 
   // ---------- persistence ----------
   function loadState() {
@@ -44,8 +59,17 @@
     try { fromDoc = Office.context.document.settings.get(SETTINGS_KEY); } catch (e) {}
     try { var raw = localStorage.getItem(localKey); if (raw && url) fromLocal = JSON.parse(raw); } catch (e) {}
     var pick = fromDoc;
-    if (fromLocal && (!pick || (fromLocal.inputs || 0) > (pick.inputs || 0))) pick = fromLocal;
+    if (fromLocal && (!pick || (fromLocal.savedAt || 0) > (pick.savedAt || 0) ||
+        ((fromLocal.savedAt || 0) === (pick.savedAt || 0) && (fromLocal.inputs || 0) > (pick.inputs || 0)))) pick = fromLocal;
     state = C.normalizeState(pick ? JSON.parse(JSON.stringify(pick)) : null);
+
+    // The clock was running when Word or the panel closed: count it up to the last sign of life.
+    if (state.manualSince != null) {
+      var until = Math.max(state.heartbeatAt || state.manualSince, state.manualSince);
+      C.stopManual(state, Math.min(until, C.manualDeadline(state)));
+      showBanner("The clock was still running when the panel closed. It was counted until " + hm(until) + " and is now stopped.", "info");
+      persistNow();
+    }
   }
 
   function persistSoon() {
@@ -53,8 +77,14 @@
     saveTimer = setTimeout(persistNow, 2500);
   }
 
-  function persistNow() {
+  function persistLocal() {
+    state.savedAt = Date.now();
     try { localStorage.setItem(localKey, JSON.stringify(state)); } catch (e) {}
+  }
+
+  function persistNow() {
+    clearTimeout(saveTimer);
+    persistLocal();
     try {
       Office.context.document.settings.set(SETTINGS_KEY, state);
       Office.context.document.settings.saveAsync(function () {});
@@ -63,17 +93,41 @@
 
   window.addEventListener("pagehide", persistNow);
 
-  // ---------- scanning the document ----------
+  // ---------- the 1-second loop ----------
   function tick() {
-    render();
-    if (scanning) return;
     var now = Date.now();
+
+    // a forgotten clock stops itself
+    var deadline = C.manualDeadline(state);
+    if (deadline != null && now >= deadline) {
+      C.stopManual(state, deadline);
+      wasActive = false;
+      persistNow();
+      notifyStop("manual");
+    }
+
+    // heartbeat so a closed panel doesn't leave the clock running forever
+    if (state.manualSince != null && now - lastHeartbeat > 15000) {
+      state.heartbeatAt = now;
+      lastHeartbeat = now;
+      persistLocal();
+    }
+
+    // the automatic window just ran out -> pop-up
+    var active = C.isActive(state, now);
+    if (wasActive && !active && state.manualSince == null) notifyStop("auto");
+    wasActive = active;
+
+    render();
+
+    if (scanning) return;
     var interval = Math.min(30000, Math.max(2500, lastScanDur * 4));
-    var recent = now - lastSelChange < 20000; // keep looking for a bit after you select: the highlight click comes after the selection
-    var due = (dirty || recent) ? now - lastScanEnd >= interval : now - lastScanEnd >= 60000;
+    var recent = now - lastPoke < 20000; // keep looking for a bit: the highlight click comes after the selection
+    var due = (dirty || recent) ? now - lastScanEnd >= interval : now - lastScanEnd >= Math.max(10000, interval);
     if (due) scan();
   }
 
+  // ---------- scanning the document ----------
   function scan() {
     if (scanning) return;
     scanning = true;
@@ -84,25 +138,28 @@
     Word.run(function (ctx) {
       var paras = ctx.document.body.paragraphs;
       paras.load("text,font/highlightColor");
-      var selParas = ctx.document.getSelection().paragraphs;
+      var sel = ctx.document.getSelection();
+      var selParas = sel.paragraphs;
       selParas.load("text");
 
       return ctx.sync().then(function () {
         var items = paras.items, n = items.length;
-        var texts = new Array(n), words = new Array(n), cls = new Array(n), sig = new Array(n);
+        var texts = new Array(n), words = new Array(n), cls = new Array(n), hl = new Array(n), th = new Array(n);
         for (var i = 0; i < n; i++) {
           var hc = items[i].font.highlightColor;
           texts[i] = items[i].text || "";
           words[i] = C.countWords(texts[i]);
           cls[i] = C.classifyHighlight(hc, filter);
           var nc = C.normColor(hc);
-          sig[i] = texts[i].length + "." + (nc == null ? "-" : nc);
+          hl[i] = nc == null ? "-" : nc;
+          th[i] = C.hash(texts[i]);
         }
-        var coarse = n + ":" + C.hash(sig.join("|"));
+        var hlSig = n + ":" + C.hash(hl.join("|"));
+        var region = C.changedRegion(prevTextHashes, th);      // text typed or deleted?
         var selIdx = locateSelection(texts, selParas.items.slice(0, 6).map(function (p) { return p.text || ""; }));
 
-        // Paragraphs that are only partly highlighted near where you're working: look word by word,
-        // so a new highlight inside an already-partly-highlighted paragraph is still noticed.
+        // Paragraphs only partly highlighted near where you're working: look word by word, so a new
+        // highlight inside an already-partly-highlighted paragraph is still noticed.
         var watch = unique(selIdx.concat(prevSelIdx)).filter(function (i) { return i < n && cls[i] === 2; });
         var refined = {};
         watch.forEach(function (i) { refined[i] = queueRefine(items[i]); });
@@ -117,27 +174,61 @@
             if (fineCache[key] && fineCache[key].len === texts[i].length && fineCache[key].bits !== bits) fineChanged = true;
             fineCache[key] = { len: texts[i].length, bits: bits };
           });
+
+          // Where exactly did you type? Use the cursor if it sits in the changed paragraphs.
+          var cursorRange = null, editIdx = null;
+          if (region) {
+            editIdx = region.last;
+            if (selIdx.length && selIdx[0] >= region.first && selIdx[0] <= region.last && selParas.items[0]) {
+              editIdx = selIdx[0];
+              cursorRange = selParas.items[0].getRange("Start").expandTo(sel.getRange("Start"));
+              cursorRange.load("text");
+            }
+          }
+          var cursorSync = cursorRange ? ctx.sync().then(function () { return cursorRange.text; }, function () { return null; })
+                                       : Promise.resolve(null);
+          return cursorSync.then(function (cursorText) {
+          var editWords = null;
+          if (editIdx != null) {
+            var before = 0;
+            for (var k = 0; k < editIdx; k++) before += words[k];
+            var inPara = words[editIdx] || 0;
+            if (cursorText != null) inPara = Math.min(inPara, C.countWords(cursorText));
+            editWords = before + inPara;
+          }
+
           prevSelIdx = selIdx;
+          prevTextHashes = th;
           return findFurthest(ctx, items, cls, words, refined, filter).then(function (f) {
-            var p = C.computeProgress(words, f.idx, f.wordsIn);
-            return { coarse: coarse, fineChanged: fineChanged, p: p, idx: f.idx, wordIdx: f.wordIdx };
+            return {
+              hlSig: hlSig, textChanged: !!region, fineChanged: fineChanged, editWords: editWords,
+              words: words, idx: f.idx, wordsIn: f.wordsIn, wordIdx: f.wordIdx
+            };
+          });
           });
         });
       });
     }).then(function (res) {
       var now = Date.now();
-      var changed = (prevCoarse !== null && res.coarse !== prevCoarse) || res.fineChanged;
-      prevCoarse = res.coarse;
+      var hlChanged = !res.textChanged && ((prevHl !== null && res.hlSig !== prevHl) || res.fineChanged);
+      prevHl = res.hlSig;
+      if (res.editWords != null) C.markEdit(state, res.editWords, now);
+
+      var p = C.computeProgress(res.words, res.idx, res.wordsIn, state.editMark ? state.editMark.words : null);
       var oldP = prog.progress;
-      prog = { progress: res.p.progress, total: res.p.total, reached: res.p.reached, lastIdx: res.idx, wordIdx: res.wordIdx };
+      prog = { progress: p.progress, total: p.total, reached: p.reached, by: p.by,
+               lastIdx: res.idx, wordIdx: res.wordIdx, paraWords: res.words };
+
       var hadBaseline = state.baselineProgress != null;
-      if (changed && !state.paused) C.recordInput(state, now, prog.progress);
+      if (res.textChanged || hlChanged) {
+        C.recordInput(state, now, prog.progress);
+        wasActive = true;
+        closeDialog();
+      }
       C.updateProgress(state, prog.progress);
-      if (changed || !hadBaseline || oldP !== prog.progress) persistSoon();
-      lastError = null;
+      if (res.textChanged || hlChanged || !hadBaseline || oldP !== prog.progress) persistSoon();
       if ($("banner").dataset.kind === "error") hideBanner();
     }).catch(function (err) {
-      lastError = err;
       console.error(err);
       if (err && err.code !== "GeneralException") showBanner("Couldn't read the document: " + (err.message || err), "error");
     }).then(function () {
@@ -181,9 +272,7 @@
       looked++;
       return ready.then(function (r) {
         for (var j = r.bits.length - 1; j >= 0; j--) {
-          if (r.bits[j]) {
-            return { idx: idx, wordsIn: C.countWords(r.texts.slice(0, j + 1).join(" ")), wordIdx: j };
-          }
+          if (r.bits[j]) return { idx: idx, wordsIn: C.countWords(r.texts.slice(0, j + 1).join(" ")), wordIdx: j };
         }
         i = idx - 1;
         return step();
@@ -209,22 +298,90 @@
 
   function unique(a) { return a.filter(function (v, i) { return a.indexOf(v) === i; }); }
 
-  // ---------- actions ----------
-  function jumpToLastHighlight() {
-    if (prog.lastIdx < 0) return;
-    var idx = prog.lastIdx, wordIdx = prog.wordIdx;
+  // ---------- the clock button ----------
+  function toggleClock() {
+    var now = Date.now();
+    if (state.manualSince != null) {
+      C.stopManual(state, now);
+      wasActive = false;
+    } else {
+      C.startManual(state, now, prog.progress);
+      lastHeartbeat = now;
+      wasActive = true;
+    }
+    closeDialog();
+    persistNow();
+    render();
+  }
+
+  // ---------- pop-up when the clock stops ----------
+  function notifyStop(kind) {
+    if (!state.notifyOnStop || dialog) return;
+    if (!Office.context.ui || !Office.context.ui.displayDialogAsync) return;
+    var url = location.href.replace(/[?#].*$/, "").replace(/[^\/]*$/, "") + "notify.html?kind=" + kind +
+      "&w=" + encodeURIComponent(state.idleWindowSec) + "&v=2";
+    var stoppedAt = kind === "auto" ? C.windowEnd(state) : Date.now();
+    Office.context.ui.displayDialogAsync(url, { height: 30, width: 26, displayInIframe: true }, function (res) {
+      if (res.status !== Office.AsyncResultStatus.Succeeded) return;
+      dialog = res.value;
+      dialog.addEventHandler(Office.EventType.DialogMessageReceived, function (arg) {
+        var msg = arg && arg.message;
+        closeDialog();
+        var now = Date.now();
+        if (msg === "still") {
+          C.bridge(state, now, BRIDGE_CAP_MS, prog.progress);
+        } else if (msg === "drop") {
+          C.uncount(state, C.MANUAL_MAX_MS);
+        } else if (msg === "start") {
+          var from = Math.max(stoppedAt || now, now - BRIDGE_CAP_MS, state.countedTo || 0);
+          C.startManual(state, Math.min(from, now), prog.progress);
+          lastHeartbeat = now;
+        }
+        wasActive = C.isActive(state, now);
+        persistNow();
+        render();
+      });
+      dialog.addEventHandler(Office.EventType.DialogEventReceived, function () { dialog = null; });
+    });
+  }
+
+  function closeDialog() {
+    if (!dialog) return;
+    try { dialog.close(); } catch (e) {}
+    dialog = null;
+  }
+
+  // ---------- other actions ----------
+  function jumpToFurthest() {
+    if (prog.by == null) return;
+    var target;
+    if (prog.by === "highlight") {
+      target = { idx: prog.lastIdx, wordIdx: prog.wordIdx, offset: null };
+    } else {
+      var loc = C.locateWord(prog.paraWords, prog.reached);
+      if (!loc) return;
+      target = { idx: loc.idx, wordIdx: null, offset: loc.offset };
+    }
     Word.run(function (ctx) {
       var paras = ctx.document.body.paragraphs;
       paras.load("text");
       return ctx.sync().then(function () {
-        var p = paras.items[idx];
+        var p = paras.items[target.idx];
         if (!p) return;
-        if (wordIdx == null) { p.getRange("End").select(); return ctx.sync(); }
+        if (target.wordIdx == null && target.offset == null) { p.getRange("End").select(); return ctx.sync(); }
         var tr = p.getTextRanges([" "], false);
         tr.load("text");
         return ctx.sync().then(function () {
-          var target = tr.items[Math.min(wordIdx, tr.items.length - 1)];
-          (target || p).getRange("End").select();
+          var j = target.wordIdx;
+          if (j == null) {
+            var acc = "";
+            for (j = 0; j < tr.items.length - 1; j++) {
+              acc += tr.items[j].text + " ";
+              if (C.countWords(acc) >= target.offset) break;
+            }
+          }
+          var r = tr.items[Math.min(j, tr.items.length - 1)];
+          (r || p).getRange("End").select();
           return ctx.sync();
         });
       });
@@ -261,15 +418,17 @@
       setTimeout(function () { resetArmed = false; btn.textContent = "Reset tracking for this file"; btn.classList.remove("confirm"); }, 4000);
       return;
     }
-    var keep = { idleWindowSec: state.idleWindowSec, colorFilter: state.colorFilter };
+    var keep = { idleWindowSec: state.idleWindowSec, colorFilter: state.colorFilter, notifyOnStop: state.notifyOnStop };
     state = C.newState();
     state.idleWindowSec = keep.idleWindowSec;
     state.colorFilter = keep.colorFilter;
-    state.baselineProgress = prog.progress;
+    state.notifyOnStop = keep.notifyOnStop;
     resetArmed = false;
+    wasActive = false;
     btn.textContent = "Reset tracking for this file";
     btn.classList.remove("confirm");
     persistNow();
+    dirty = true; lastScanEnd = 0; // re-read progress (typing marks are gone) and set a new baseline
     render();
   }
 
@@ -278,16 +437,17 @@
     $("idleSelect").value = String(state.idleWindowSec);
     if (!$("idleSelect").value) $("idleSelect").value = "120";
     $("colorSelect").value = state.colorFilter || "any";
+    $("notifyStop").checked = state.notifyOnStop !== false;
     var auto = false;
     try { auto = !!Office.context.document.settings.get(AUTO_OPEN_KEY); } catch (e) {}
     $("autoOpen").checked = auto;
 
     $("idleSelect").addEventListener("change", function (e) { state.idleWindowSec = Number(e.target.value); persistNow(); render(); });
+    $("notifyStop").addEventListener("change", function (e) { state.notifyOnStop = e.target.checked; persistNow(); });
     $("colorSelect").addEventListener("change", function (e) {
       state.colorFilter = e.target.value;
       fineCache = {};
-      // progress is now measured differently: restart the pace baseline from the new reading
-      state.baselineProgress = null;
+      state.baselineProgress = null; // progress is measured differently now: restart the pace from here
       persistNow();
       dirty = true; lastScanEnd = 0;
     });
@@ -297,38 +457,45 @@
         Office.context.document.settings.saveAsync(function () {});
       } catch (err) {}
     });
-    $("pauseBtn").addEventListener("click", function () { state.paused = !state.paused; persistNow(); render(); });
-    $("jumpBtn").addEventListener("click", jumpToLastHighlight);
+    $("clockBtn").addEventListener("click", toggleClock);
+    $("jumpBtn").addEventListener("click", jumpToFurthest);
     $("csvBtn").addEventListener("click", copyCSV);
     $("resetBtn").addEventListener("click", reset);
   }
 
+  var PLAY = '<path d="M6 4l10 6-10 6z"/>';
+  var STOP = '<rect x="5" y="5" width="10" height="10" rx="1.5"/>';
+
   function render() {
     var now = Date.now();
+    var manual = state.manualSince != null;
     var active = C.isActive(state, now);
 
     // status
-    var dot = $("statusDot"), label = $("statusLabel"), hint = $("statusHint"), pb = $("pauseBtn");
-    dot.className = "dot" + (state.paused ? " paused" : active ? " active" : "");
-    if (state.paused) {
-      label.textContent = "Paused";
-      hint.textContent = "Highlights aren't being timed. Press ▶ to resume.";
+    var dot = $("statusDot"), label = $("statusLabel"), hint = $("statusHint");
+    dot.className = "dot" + (manual ? " active manual" : active ? " active" : "");
+    if (manual) {
+      label.textContent = "Clock running";
+      hint.textContent = "Everything counts until you press Stop.";
     } else if (active) {
-      var since = now - state.lastInputAt, left = state.idleWindowSec * 1000 - since;
+      var since = now - state.lastInputAt, left = C.windowEnd(state) - now;
       label.textContent = "Studying";
-      hint.textContent = "Last highlight " + C.formatDuration(since) + " ago · counting for another " + C.formatDuration(left);
-    } else if (state.lastInputAt) {
+      hint.textContent = "Last highlight or edit " + C.formatDuration(since) + " ago · counting for another " + C.formatDuration(left);
+    } else if (state.lastInputAt || state.committedMs) {
       label.textContent = "Idle";
-      hint.textContent = "Not counting. Your next highlight resumes the clock.";
+      hint.textContent = "Not counting. Highlight, type, or start the clock.";
     } else {
       label.textContent = "Ready";
-      hint.textContent = "Highlight as you study, the clock starts with your first highlight.";
+      hint.textContent = "The clock starts with your first highlight or edit, or press Start.";
     }
-    pb.innerHTML = state.paused
-      ? '<svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="M6 4l10 6-10 6z"/></svg>'
-      : '<svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><rect x="5" y="4" width="3.2" height="12" rx="1"/><rect x="11.8" y="4" width="3.2" height="12" rx="1"/></svg>';
-    pb.title = state.paused ? "Resume tracking" : "Pause tracking";
-    pb.setAttribute("aria-label", pb.title);
+
+    // clock button
+    $("clockBtn").classList.toggle("running", manual);
+    $("clockIcon").innerHTML = manual ? STOP : PLAY;
+    $("clockLabel").textContent = manual ? "Stop clock" : "Start clock";
+    $("clockHint").textContent = manual
+      ? "Started at " + hm(state.manualSince) + ". Stops by itself after 2 h without highlights or typing."
+      : "For exercises or reading without highlighting. Runs until you stop it.";
 
     // times
     var cur = C.currentSession(state, now);
@@ -345,11 +512,12 @@
       $("progressPct").textContent = (pct < 10 ? pct.toFixed(1) : Math.round(pct)) + "%";
       $("progressFill").style.width = pct + "%";
       $("progressMark").style.left = "calc(" + pct + "% - 1px)";
-      $("progressDetail").textContent = prog.lastIdx < 0
-        ? "No highlights yet. " + prog.total.toLocaleString() + " words in this file."
-        : "Word " + prog.reached.toLocaleString() + " of " + prog.total.toLocaleString() + " · paragraph " + (prog.lastIdx + 1);
+      $("progressDetail").textContent = prog.by == null
+        ? "No highlights or typing yet. " + prog.total.toLocaleString() + " words in this file."
+        : "Word " + prog.reached.toLocaleString() + " of " + prog.total.toLocaleString() +
+          (prog.by === "typing" ? " · where you last typed furthest" : " · your furthest highlight");
     }
-    $("jumpBtn").disabled = prog.lastIdx < 0;
+    $("jumpBtn").disabled = prog.by == null;
 
     // estimate
     var e = C.estimate(state, prog.progress, now);
@@ -357,7 +525,7 @@
       $("etaMain").textContent = "–"; $("etaDetail").textContent = "";
     } else if (e.ok && e.done) {
       $("etaMain").textContent = "Done 🎉";
-      $("etaDetail").textContent = "You've highlighted to the end of the file.";
+      $("etaDetail").textContent = "You've reached the end of the file.";
     } else if (e.ok) {
       $("etaMain").textContent = "≈ " + C.formatDuration(roundEta(e.remainingMs));
       $("etaDetail").textContent = "Pace " + (e.pacePerHour * 100).toFixed(1) + "% of the file per active hour, from " +
@@ -382,14 +550,16 @@
   var lastSessionsHtml = "";
   function renderSessions(now) {
     var list = state.sessions.slice(-8).reverse();
+    var newest = state.sessions[state.sessions.length - 1];
+    var liveEnd = C.isActive(state, now) ? now : null;
     var html;
     if (!list.length) {
-      html = '<li class="muted small empty">No study sessions yet. Highlight something to start.</li>';
+      html = '<li class="muted small empty">No study sessions yet. Highlight, type or start the clock.</li>';
     } else {
       html = list.map(function (s) {
         var gain = s.pStart != null && s.pEnd != null ? (s.pEnd - s.pStart) * 100 : null;
         var g = gain == null ? "" : (gain >= 0 ? "+" : "") + gain.toFixed(1) + "%";
-        return '<li><div class="when"><b>' + dayLabel(s.start, now) + '</b> <span>' + hm(s.start) + "–" + hm(s.end) +
+        return '<li><div class="when"><b>' + dayLabel(s.start, now) + '</b> <span>' + hm(s.start) + "–" + hm(s === newest && liveEnd ? liveEnd : s.end) +
           '</span></div><div class="dur">' + C.formatDuration(C.sessionActiveMs(state, s, now)) +
           '</div><div class="gain' + (gain > 0 ? " pos" : "") + '">' + g + "</div></li>";
       }).join("");
@@ -404,6 +574,9 @@
     return new Date(t).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
   }
 
-  function showBanner(msg, kind) { var b = $("banner"); b.textContent = msg; b.hidden = false; b.dataset.kind = kind || ""; }
+  function showBanner(msg, kind) {
+    var b = $("banner"); b.textContent = msg; b.hidden = false; b.dataset.kind = kind || "";
+    b.title = "Click to dismiss"; b.onclick = hideBanner;
+  }
   function hideBanner() { var b = $("banner"); b.hidden = true; b.dataset.kind = ""; }
 })();

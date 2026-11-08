@@ -82,3 +82,14 @@ body { font: 13px/1.45 "Segoe UI", system-ui, -apple-system, "Helvetica Neue", A
 .check { display: flex; gap: 8px; align-items: flex-start; margin-top: 12px; }
 .danger-btn { margin-top: 14px; background: none; border: 1px solid var(--line); color: var(--danger); border-radius: 6px; padding: 6px 10px; font: inherit; cursor: pointer; }
 .danger-btn.confirm { border-color: var(--danger); font-weight: 600; }
+
+/* v2: start/stop clock */
+.dot.manual { background: var(--accent); }
+.big-time { margin-bottom: 8px; }
+.clock-btn { display: inline-flex; align-items: center; gap: 8px; width: 100%; justify-content: center; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--ink); background: var(--ink); color: var(--card); font: inherit; font-weight: 600; cursor: pointer; }
+.clock-btn svg { fill: currentColor; }
+.clock-btn:hover { opacity: .9; }
+.clock-btn.running { background: transparent; color: var(--ink); border-color: var(--line); }
+.clock-btn.running svg { fill: var(--danger); }
+.clock-hint { margin: 6px 0 12px; text-align: center; }
+.version { margin: 4px 0 0; }

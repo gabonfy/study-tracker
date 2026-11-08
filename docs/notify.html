@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Study clock stopped</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <style>
+    :root { --bg: #ffffff; --ink: #1d1d1b; --muted: #6b6a64; --line: #e4e2da; --hl: #ffe14d; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #262624; --ink: #f1f0ea; --muted: #a3a198; --line: #3a3935; --hl: #e8c832; } }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); }
+    body { font: 13px/1.4 "Segoe UI", system-ui, -apple-system, Arial, sans-serif; display: flex; align-items: center; justify-content: center; }
+    .box { padding: 14px 16px; max-width: 420px; width: 100%; box-sizing: border-box; }
+    h1 { font-size: 15px; margin: 0 0 4px; display: flex; align-items: center; gap: 8px; }
+    h1 i { width: 10px; height: 10px; border-radius: 50%; background: #a8a69d; display: inline-block; }
+    p { margin: 0 0 12px; color: var(--muted); }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    button { font: inherit; padding: 7px 12px; border-radius: 7px; border: 1px solid var(--line); background: transparent; color: var(--ink); cursor: pointer; }
+    button.primary { background: var(--ink); color: var(--bg); border-color: var(--ink); font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1><i></i><span id="title">Study clock stopped</span></h1>
+    <p id="msg"></p>
+    <div class="row" id="buttons"></div>
+  </div>
+  <script>
+    (function () {
+      var q = {};
+      location.search.replace(/^\?/, "").split("&").forEach(function (kv) { var p = kv.split("="); if (p[0]) q[p[0]] = decodeURIComponent(p[1] || ""); });
+      var w = Number(q.w) || 120;
+      var wText = w >= 60 ? (w / 60) + " min" : w + " s";
+      var buttons = q.kind === "manual"
+        ? [["drop", "Don't count those 2 h", true], ["keep", "Keep them, I was studying", false]]
+        : [["still", "I'm still studying", true], ["start", "Start clock (exercises)", false], ["break", "Taking a break", false]];
+      document.getElementById("msg").textContent = q.kind === "manual"
+        ? "The clock ran for 2 hours with no highlights or typing, so it stopped itself. Were you studying all that time?"
+        : "No highlights or typing for " + wText + ". Still at it? Pick \u201cI'm still studying\u201d and the time since it stopped counts too (up to 5 min).";
+      var row = document.getElementById("buttons");
+      buttons.forEach(function (b) {
+        var el = document.createElement("button");
+        el.textContent = b[1];
+        if (b[2]) el.className = "primary";
+        el.onclick = function () { send(b[0]); };
+        row.appendChild(el);
+      });
+      var ready = false;
+      function send(m) {
+        if (ready && Office.context.ui && Office.context.ui.messageParent) Office.context.ui.messageParent(m);
+      }
+      Office.onReady(function () { ready = true; });
+    })();
+  </script>
+</body>
+</html>
